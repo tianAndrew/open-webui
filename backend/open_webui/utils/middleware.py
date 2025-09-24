@@ -523,6 +523,172 @@ async def chat_web_search_handler(
     return form_data
 
 
+async def chat_mcp_memory_handler(
+    request: Request, form_data: dict, extra_params: dict, user
+):
+    # features.mcp_memory can be bool or dict with { url, api_key, timeout, params }
+    features = form_data.get("features", {}) or {}
+    # If not provided by frontend, default to enabled with defaults
+    mcp_cfg = features.get("mcp_memory") if isinstance(features, dict) else True
+    if mcp_cfg is False:
+        return form_data
+
+    if isinstance(mcp_cfg, dict):
+        mcp_url = mcp_cfg.get("url") or "http://127.0.0.1:8080/v1/memories/search"
+        mcp_api_key = mcp_cfg.get("api_key")
+        mcp_timeout = mcp_cfg.get("timeout", 8)
+        mcp_params = mcp_cfg.get("params", {})
+    else:
+        # If only True is provided, require server-side default via env or skip
+        mcp_url = "http://127.0.0.1:8080/v1/memories/search"
+        mcp_api_key = None
+        mcp_timeout = 8
+        mcp_params = {}
+
+    # Ask task model to decide whether to call MCP and what query to use
+    try:
+        messages = form_data["messages"]
+        user_message = get_last_user_message(messages)
+
+        task_model_id = get_task_model_id(
+            form_data["model"],
+            request.app.state.config.TASK_MODEL,
+            request.app.state.config.TASK_MODEL_EXTERNAL,
+            request.app.state.MODELS,
+        )
+
+        decision_prompt = (
+            "You are a decision helper. Decide whether calling an external Memory Collection Provider (MCP) would help answer the user's query.\n"
+            "Return a strict JSON object with keys: call (boolean) and query (string).\n"
+            "Consider recent conversation and only call when memory is likely helpful.\n"
+            "Example: {\"call\": true, \"query\": \"project alpha auth tokens\"}"
+        )
+
+        payload = {
+            "model": task_model_id,
+            "messages": [
+                {"role": "system", "content": decision_prompt},
+                {"role": "user", "content": f"Conversation: {json.dumps(messages[-6:])}\nQuery: {user_message}"},
+            ],
+            "stream": False,
+            "metadata": {
+                **(request.state.metadata if hasattr(request.state, "metadata") else {}),
+                "task": "mcp_memory_decision",
+                "task_body": {"model": form_data["model"]},
+                "chat_id": form_data.get("chat_id", None),
+            },
+        }
+
+        res = await generate_chat_completion(request, form_data=payload, user=user)
+        if hasattr(res, "body_iterator"):
+            content = None
+            async for chunk in res.body_iterator:
+                data = json.loads(chunk.decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+        else:
+            content = res["choices"][0]["message"]["content"]
+
+        call_mcp = False
+        mcp_query = user_message or ""
+        if content:
+            try:
+                bracket_start = content.find("{")
+                bracket_end = content.rfind("}") + 1
+                parsed = json.loads(content[bracket_start:bracket_end]) if bracket_start != -1 else json.loads(content)
+                call_mcp = bool(parsed.get("call", False))
+                if isinstance(parsed.get("query"), str) and parsed.get("query").strip() != "":
+                    mcp_query = parsed.get("query").strip()
+            except Exception:
+                call_mcp = False
+
+        if not call_mcp:
+            return form_data
+
+        # Call MCP REST API
+        headers = {"Content-Type": "application/json"}
+        if mcp_api_key:
+            headers["Authorization"] = f"Bearer {mcp_api_key}"
+
+        # Build MCP request body according to provided API
+        metadata = extra_params.get("__metadata__", {}) if isinstance(extra_params, dict) else {}
+        session_id = metadata.get("session_id") or metadata.get("chat_id") or form_data.get("chat_id") or "session_default"
+        model_info = extra_params.get("__model__", {}) if isinstance(extra_params, dict) else {}
+
+        group_id = mcp_params.get("group_id") if isinstance(mcp_params, dict) else None
+        agent_ids = mcp_params.get("agent_id") if isinstance(mcp_params, dict) else None
+        user_ids = mcp_params.get("user_id") if isinstance(mcp_params, dict) else None
+        limit = mcp_params.get("limit", 5) if isinstance(mcp_params, dict) else 5
+        mcp_filter = mcp_params.get("filter", {}) if isinstance(mcp_params, dict) else {}
+
+        if not group_id:
+            group_id = "default_group"
+        if not agent_ids:
+            # prefer model id or name
+            agent_ids = [model_info.get("id") or model_info.get("name") or "default_agent"]
+        elif isinstance(agent_ids, str):
+            agent_ids = [agent_ids]
+        if not user_ids:
+            uid = getattr(user, "id", None) or (metadata.get("user_id") if isinstance(metadata.get("user_id"), str) else None)
+            user_ids = [uid or "default_user"]
+        elif isinstance(user_ids, str):
+            user_ids = [user_ids]
+
+        body = {
+            "session": {
+                "group_id": group_id,
+                "agent_id": agent_ids,
+                "user_id": user_ids,
+                "session_id": session_id,
+            },
+            "query": mcp_query,
+            "filter": mcp_filter,
+            "limit": limit,
+        }
+
+        timeout = aiohttp.ClientTimeout(total=mcp_timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(mcp_url, headers=headers, json=body) as resp:
+                    resp.raise_for_status()
+                    mcp_data = await resp.json()
+        except Exception as e:
+            log.debug(f"MCP request failed: {e}")
+            return form_data
+
+        # Extract memory text from response
+        memory_text = None
+        if isinstance(mcp_data, dict):
+            # common shapes: { memory: "..." } or { items: [ {text: "..."}, ...] }
+            if isinstance(mcp_data.get("memory"), str):
+                memory_text = mcp_data.get("memory")
+            elif isinstance(mcp_data.get("items"), list):
+                memory_text = "\n".join(
+                    [str(it.get("text") or it.get("content") or it) for it in mcp_data.get("items")]
+                )
+            elif isinstance(mcp_data.get("memories"), list):
+                memory_text = "\n".join([str(x) for x in mcp_data.get("memories")])
+        if not memory_text:
+            # try text response
+            try:
+                if hasattr(mcp_data, "__str__"):
+                    memory_text = str(mcp_data)
+            except Exception:
+                memory_text = None
+
+        if not memory_text:
+            return form_data
+
+        # Append memory to prompt as system message (append)
+        form_data["messages"] = add_or_update_system_message(
+            f"External Memory (MCP):\n{memory_text}\n", form_data["messages"], append=True
+        )
+
+        return form_data
+    except Exception as e:
+        log.debug(f"mcp_memory_handler error: {e}")
+        return form_data
+
+
 async def chat_image_generation_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
@@ -950,6 +1116,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 request, form_data, extra_params, user
             )
 
+        if "mcp_memory" in features and features["mcp_memory"]:
+            form_data = await chat_mcp_memory_handler(
+                request, form_data | {"features": {"mcp_memory": features["mcp_memory"]}}, extra_params, user
+            )
+
         if "web_search" in features and features["web_search"]:
             form_data = await chat_web_search_handler(
                 request, form_data, extra_params, user
@@ -1222,6 +1393,122 @@ async def process_chat_response(
                             )
                         except Exception as e:
                             pass
+
+                # MCP persist hook: always-on by default (can be disabled via features.mcp_persist = false)
+                try:
+                    features = form_data.get("features", {}) or {}
+                    mcp_persist_cfg = features.get("mcp_persist") if isinstance(features, dict) else True
+                    if mcp_persist_cfg is not False:
+                        # Ask model whether to persist memory and what to store
+                        if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+                            models = {
+                                request.state.model["id"]: request.state.model,
+                            }
+                        else:
+                            models = request.app.state.MODELS
+
+                        task_model_id = get_task_model_id(
+                            message["model"],
+                            request.app.state.config.TASK_MODEL,
+                            request.app.state.config.TASK_MODEL_EXTERNAL,
+                            models,
+                        )
+
+                        decision_prompt = (
+                            "You decide whether to persist the latest assistant/user exchange as a memory.\n"
+                            "Return strict JSON with: persist (boolean), episode_content (string), episode_type (string: message|event|note)."
+                        )
+
+                        payload = {
+                            "model": task_model_id,
+                            "messages": [
+                                {"role": "system", "content": decision_prompt},
+                                {"role": "user", "content": f"Messages: {json.dumps(messages[-6:])}"},
+                            ],
+                            "stream": False,
+                            "metadata": {
+                                **(request.state.metadata if hasattr(request.state, "metadata") else {}),
+                                "task": "mcp_memory_persist_decision",
+                                "task_body": {"model": message["model"]},
+                                "chat_id": metadata.get("chat_id"),
+                            },
+                        }
+
+                        res = await generate_chat_completion(request, form_data=payload, user=user)
+                        if hasattr(res, "body_iterator"):
+                            content = None
+                            async for chunk in res.body_iterator:
+                                data = json.loads(chunk.decode("utf-8"))
+                                content = data["choices"][0]["message"]["content"]
+                        else:
+                            content = res["choices"][0]["message"]["content"]
+
+                        do_persist = False
+                        episode_content = None
+                        episode_type = "message"
+                        if content:
+                            try:
+                                b = content.find("{")
+                                e = content.rfind("}") + 1
+                                parsed = json.loads(content[b:e]) if b != -1 else json.loads(content)
+                                do_persist = bool(parsed.get("persist", False))
+                                if isinstance(parsed.get("episode_content"), str):
+                                    episode_content = parsed.get("episode_content").strip()
+                                if isinstance(parsed.get("episode_type"), str) and parsed.get("episode_type").strip() != "":
+                                    episode_type = parsed.get("episode_type").strip()
+                            except Exception:
+                                do_persist = False
+
+                        if do_persist and episode_content:
+                            # Prepare MCP body
+                            cfg = mcp_persist_cfg if isinstance(mcp_persist_cfg, dict) else {}
+                            mcp_url = cfg.get("url") or "http://127.0.0.1:8080/v1/memories"
+                            mcp_api_key = cfg.get("api_key")
+                            mcp_timeout = cfg.get("timeout", 8)
+                            mcp_params = cfg.get("params", {}) if isinstance(cfg.get("params", {}), dict) else {}
+
+                            headers = {"Content-Type": "application/json"}
+                            if mcp_api_key:
+                                headers["Authorization"] = f"Bearer {mcp_api_key}"
+
+                            # session fields
+                            session_id = metadata.get("session_id") or metadata.get("chat_id") or "session_default"
+                            group_id = mcp_params.get("group_id") or "default_group"
+                            agent_ids = mcp_params.get("agent_id") or [model.get("id") or model.get("name") or "default_agent"]
+                            if isinstance(agent_ids, str):
+                                agent_ids = [agent_ids]
+                            user_ids = mcp_params.get("user_id") or [getattr(user, "id", None) or "default_user"]
+                            if isinstance(user_ids, str):
+                                user_ids = [user_ids]
+
+                            producer = mcp_params.get("producer") or (getattr(user, "id", None) or "user")
+                            produced_for = mcp_params.get("produced_for") or (model.get("id") or model.get("name") or "agent")
+                            meta = mcp_params.get("metadata", {}) if isinstance(mcp_params.get("metadata", {}), dict) else {}
+
+                            body = {
+                                "session": {
+                                    "group_id": group_id,
+                                    "agent_id": agent_ids,
+                                    "user_id": user_ids,
+                                    "session_id": session_id,
+                                },
+                                "producer": producer,
+                                "produced_for": produced_for,
+                                "episode_content": episode_content,
+                                "episode_type": episode_type,
+                                "metadata": meta,
+                            }
+
+                            timeout = aiohttp.ClientTimeout(total=mcp_timeout)
+                            try:
+                                async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                                    async with session.post(mcp_url, headers=headers, json=body) as resp:
+                                        resp.raise_for_status()
+                                        _ = await resp.text()
+                            except Exception as e:
+                                log.debug(f"MCP persist failed: {e}")
+                except Exception as e:
+                    log.debug(f"mcp_persist hook error: {e}")
 
                 if TASKS.TITLE_GENERATION in tasks:
                     user_message = get_last_user_message(messages)
